@@ -19,7 +19,7 @@ public class LibraClientTest {
             ExecutorFactory factory = new ExecutorFactory();
             factory.addExecutor("project1", new TestExecutor());
             factory.addExecutor("project2", new AnotherTestExecutor());
-            LibraClient watcher = new LibraClient("id1", "ubuntuB61:2181,ubuntuB70:2181", 20000, factory);
+            LibraClient watcher = new LibraClient("id3", "211.87.224.213:2181", 2000, factory);
             watcher.start();
             Thread.sleep(Integer.MAX_VALUE);
         } catch (IOException e) {

@@ -1,7 +1,7 @@
 package client;
 
 import client.config.LibraClientConfig;
-import client.state.ClientDataVersion;
+import client.state.ZKDataVersion;
 import client.state.ProjectState;
 import common.exception.*;
 import common.util.LibraZKPathUtil;
@@ -17,8 +17,8 @@ import java.util.*;
  * Main class for libra client
  *
  * @author xccui
- * Date: 13-9-16
- * Time: 10:09
+ *         Date: 13-9-16
+ *         Time: 10:09
  */
 public class LibraClient {
     private static Logger LOG = LoggerFactory.getLogger(LibraClient.class);
@@ -32,41 +32,43 @@ public class LibraClient {
     public enum LibraClientEvent {
         projectChanged, taskListChanged, workerListChanged
     }
+
     private ExecutorFactory executorFactory;
 
-    volatile ProjectState projectState;
-    private volatile List<String> workerList;
-    private volatile List<String> taskList;
-    private volatile List<String> myTaskList;
-    private volatile ClientDataVersion currentState;
+    ProjectState projectState;
+    private List<String> workerList;
+    private List<String> taskList;
+    private ZKDataVersion currentState;
 
     private Object rebalanceLock;
     private IRebalanceTool rebalanceTool;
-    private LibraClientWatcher watcher;
-    private LibraClientAgent agent;
+    private ZKAgent agent;
+
     public LibraClient(String myId, String hosts, int sessionTimeout, ExecutorFactory executorFactory) throws IOException {
         this.myId = myId;
         this.hosts = hosts;
         this.sessionTimeout = sessionTimeout;
         this.executorFactory = executorFactory;
         myAllWorkerPath = LibraZKPathUtil.genMyAllWorkerPath(myId);
-        watcher = new LibraClientWatcher(this);
-        agent = new LibraClientAgent(watcher,myId,hosts,sessionTimeout);
+        agent = new ZKAgent(myId, hosts, sessionTimeout, this);
         rebalanceTool = new DefaultRebalanceTool();
         rebalanceLock = new Object();
-        currentState = new ClientDataVersion();
+        currentState = new ZKDataVersion();
     }
+
     void register() throws InterruptedException, ConfigException, KeeperException {
         agent.register();
         //init project stat
         projectState = ProjectState.createStandbyState();
     }
+
     public void start() throws KeeperException, InterruptedException, ConfigException, IOException {
         workerList = new ArrayList<>();
         taskList = new ArrayList<>();
         register();
     }
-    public void restart(){
+
+    public void restart() {
         try {
             agent.close();
             executorFactory.stopCurrentExecutor();
@@ -80,182 +82,105 @@ public class LibraClient {
             forceExit();
         }
     }
-    private synchronized void activate(final String projectName, ClientDataVersion snapshot) throws KeeperException, InterruptedException, ExecutorException {
+
+    private synchronized void activate(final String projectName) throws KeeperException, InterruptedException, ExecutorException {
         LOG.info("Activate - projectName:" + projectName);
         agent.addMyIdToActiveWorkerRoot(projectName);
         executorFactory.loadExecutor(projectName);
         currentState.updateProjectVersion();
-        snapshot.updateProjectVersion();
     }
 
-    private synchronized void inactivate(final String oldProjectName, ClientDataVersion snapshot) throws KeeperException, InterruptedException, WrongStateException {
+    private synchronized void inactivate(final String oldProjectName) throws KeeperException, InterruptedException, WrongStateException {
         LOG.info("Inactivate - projectName:" + oldProjectName);
         executorFactory.stopCurrentExecutor();
         agent.deleteMyIdFromActiveWorkerRoot(oldProjectName);
         currentState.updateProjectVersion();
-        snapshot.updateProjectVersion();
     }
-    private synchronized void reassignTasks(Set<String> taskToBeReleased, Set<String> taskReleased, Set<String> taskTobeOwned, Set<String> taskOwned) throws OperationOutOfDateException, ExecutorException, KeeperException, InterruptedException, ZKOperationFailedException {
+
+    private synchronized void reassignTasks(String projectName, List<String> taskList, Set<String> taskToBeReleased, Set<String> taskReleased, Set<String> taskTobeOwned, Set<String> taskOwned) throws OperationOutOfDateException, ExecutorException, KeeperException, InterruptedException, ZKOperationFailedException {
         taskToBeReleased.removeAll(taskReleased);
         taskTobeOwned.removeAll(taskOwned);
-        executorFactory.pauseCurrentExecutor(projectState.getProjectName());
-        agent.releaseTasks(projectState.getProjectName(),taskToBeReleased, taskReleased);
-        agent.checkAndOwnTasks(projectState.getProjectName(),taskTobeOwned, workerList, taskOwned);
-        executorFactory.startCurrentExecutor(projectState.getProjectName(), myTaskList);
+        executorFactory.pauseCurrentExecutor(projectName);
+        agent.releaseTasks(projectName, taskToBeReleased, taskReleased);
+        agent.checkAndOwnTasks(projectName, taskTobeOwned, workerList, taskOwned);
+        executorFactory.startCurrentExecutor(projectName, taskList);
+    }
+
+    private ZKDataVersion updateZKData(LibraClientEvent event) throws KeeperException, InterruptedException, ExecutorException {
+        switch (event) {
+            case projectChanged:
+                String newProjectName = agent.fetchMyProjectName();
+                ProjectState oldProjectState = projectState;
+                if (oldProjectState.isNewProjectName(newProjectName) && newProjectName.length() > 0) {
+                    projectState = ProjectState.createActiveState(newProjectName);
+                    if (executorFactory.isProjectSupported(newProjectName)) {
+                        if (oldProjectState.isActive()) {
+                            //reactive
+                            LOG.info("From active to active");
+                            inactivate(oldProjectState.getProjectName());
+                        }
+                        //active
+                        LOG.info("From inactive to active");
+                        activate(newProjectName);
+                        setWorkerList(agent.fetchWorkerList(projectState.getCurrentWorkerRoot()));
+                        LOG.debug("Update workers: " + getWorkerList().toString());
+                        setTaskList(agent.fetchTaskList(projectState.getCurrentTaskRoot()));
+                        LOG.debug("Update tasks: " + getTaskList().toString());
+                    } else {
+                        LOG.info("Not supported projectName " + newProjectName + ", will reset to " + oldProjectState.getProjectName());
+                        projectState = oldProjectState;
+                        agent.resetUnsupportedProjectName(newProjectName, oldProjectState.getProjectName());
+                    }
+                } else if (newProjectName.length() == 0) {
+                    if (oldProjectState.isActive()) {
+                        //inactive
+                        LOG.info("from active to inactive");
+                        inactivate(oldProjectState.getProjectName());
+                        projectState = ProjectState.createStandbyState();
+                    }
+                }
+                break;
+            case workerListChanged:
+                setWorkerList(agent.fetchWorkerList(projectState.getCurrentWorkerRoot()));
+                LOG.debug("Update workers: " + getWorkerList().toString());
+                break;
+            case taskListChanged:
+                setTaskList(agent.fetchTaskList(projectState.getCurrentTaskRoot()));
+                LOG.debug("Update tasks: " + getTaskList().toString());
+                break;
+            default:
+                System.err.println("Unknown event: " + event);
+                System.exit(1);
+        }
+        return currentState.makeSnapshot();
     }
 
     void handleEvent(LibraClientEvent event) throws InterruptedException {
         LOG.info(event.name() + " start");
         int retry = LibraClientConfig.getIntProperty(LibraClientConfig.RETRY_TIMES_KEY);
         boolean success = false;
-        ClientDataVersion snapshot = currentState.makeSnapshot();
-        Set<String> taskToBeReleased = new HashSet<>(executorFactory.getCurrentTaskList());
-        Set<String> taskToBeOwned = new HashSet<>();
-        Set<String> taskReleased = new HashSet<>();
-        Set<String> taskOwned = new HashSet<>();
-        String newProjectName = null;
-        boolean inactive = true;
-        boolean active = true;
-        boolean recalculate = true;
-        boolean updateTaskList = true;
-        boolean updateWorkerList = true;
-        ProjectState oldProjectState = projectState;
-        LOG.info("=============== Handle Event start ===============");
-        while (!success && retry > 0) {
-            try{
-                currentState.checkOutOfDate(snapshot);
-                switch (event){
-                    case projectChanged:
-                        if(null == newProjectName){
-                            newProjectName = agent.fetchMyProjectName();
-                        }
-                        if (oldProjectState.isNewProjectName(newProjectName) && newProjectName.length() > 0) {
-                            projectState = ProjectState.createActiveState(newProjectName);
-                            if(executorFactory.isProjectSupported(newProjectName)){
-                                if(oldProjectState.isActive() && inactive) {
-                                    //reactive
-                                    LOG.info("from active to active");
-                                    inactivate(oldProjectState.getProjectName(), snapshot);
-                                    inactive = false;
-                                }
-                                //active
-                                if(active){
-                                    LOG.info("from inactive to active");
-                                    activate(newProjectName, snapshot);
-                                    active = false;
-                                }
-                                if(updateTaskList) {
-                                    setTaskList(agent.fetchTaskList(projectState.getCurrentTaskRoot()), snapshot);
-                                    updateTaskList = false;
-                                }
-                                if(updateWorkerList) {
-                                    setWorkerList(agent.fetchWorkerList(projectState.getCurrentWorkerRoot()), snapshot);
-                                    updateWorkerList = false;
-                                }
-                                if(recalculate) {
-                                    recalculateMyTasks();
-                                    taskToBeOwned.addAll(myTaskList);
-                                    recalculate = false;
-                                }
-                                reassignTasks(taskToBeReleased,taskReleased, taskToBeOwned, taskOwned);
-                            }else {
-                                LOG.info("Not supported projectName " + newProjectName + ", will reset to " + oldProjectState.getProjectName());
-                                projectState = oldProjectState;
-                                agent.resetUnsupportedProjectName(newProjectName, oldProjectState.getProjectName());
-                            }
-                        } else if (newProjectName.length() == 0) {
-                            if(oldProjectState.isActive() && inactive) {
-                               //inactive
-                                LOG.info("from active to inactive");
-                                inactivate(oldProjectState.getProjectName(), snapshot);
-                                inactive = false;
-                                projectState = ProjectState.createStandbyState();
-                            }
-                        }
-                        success  = true;
-                        break;
-                    case workerListChanged:
-                        if(!projectState.isActive()) {
-                            throw new ZKOperationFailedException("Project state is not active.");
-                        }
-                        if(updateWorkerList) {
-                            setWorkerList(agent.fetchWorkerList(projectState.getCurrentWorkerRoot()), snapshot);
-                            updateWorkerList = false;
-                        }
-                        LOG.info("Workers: " + getWorkerList().toString());
-                        if(recalculate) {
-                            recalculateMyTasks();
-                            taskToBeOwned.addAll(myTaskList);
-                            recalculate = false;
-                        }
-                        reassignTasks(taskToBeReleased,taskReleased,taskToBeOwned, taskOwned);
-                        success = true;
-                        break;
-                    case taskListChanged:
-                        if(!projectState.isActive()) {
-                            throw new ZKOperationFailedException("Project state is not active.");
-                        }
-                        if(updateTaskList) {
-                            setTaskList(agent.fetchTaskList(projectState.getCurrentTaskRoot()), snapshot);
-                            updateTaskList = false;
-                        }
-                        LOG.info("Tasks: " + getTaskList().toString());
-                        if(recalculate) {
-                            recalculateMyTasks();
-                            taskToBeOwned.addAll(myTaskList);
-                            recalculate = false;
-                        }
-                        reassignTasks(taskToBeReleased,taskReleased, taskToBeOwned, taskOwned);
-                        success = true;
-                        break;
+        ZKDataVersion snapshot = null;
+        while (!success && retry >= 0) {
+            try {
+                snapshot = updateZKData(event);
+                success = true;
+            } catch (Exception e) {
+                if (e instanceof KeeperException) {
+                    agent.reset();
                 }
-            } catch(WrongStateException ex) {
-                ex.printStackTrace();
+                e.printStackTrace();
+                LOG.warn("Update ZooKeeper data failed, " + retry + "times left");
                 --retry;
-                LOG.warn("Wrong state! Will retry in " + retryInterval + " ms. " + retry + " times left.");
-                Thread.sleep(retryInterval);
-            }catch (KeeperException.ConnectionLossException ex){
-                ex.printStackTrace();
-                --retry;
-                LOG.warn("Connection loss! Will retry in " + retryInterval + " ms. " + retry + " times left.");
-                Thread.sleep(retryInterval);
-            }catch (KeeperException ex){
-                ex.printStackTrace();
-                agent.reset();
-                --retry;
-                LOG.warn("Keeper Exception! Will retry in " + retryInterval + " ms. " + retry + " times left.");
-                Thread.sleep(retryInterval);
-            }catch (ZKOperationFailedException ex) {
-                ex.printStackTrace();
-                --retry;
-                LOG.warn("ZKOperationFailed Exception! Will retry in " + retryInterval + " ms. " + retry + " times left.");
-                Thread.sleep(retryInterval);
-            } catch (OperationOutOfDateException ex){
-                ex.printStackTrace();
-                LOG.warn("OperationOutOfDate! " + event.toString() + " will abort!");
-                return;
-            }catch (InterruptedException ex){
-                ex.printStackTrace();
-                forceExit();
-            } catch (ExecutorException ex) {
-                ex.printStackTrace();
-                forceExit();
-            } finally {
-                if (retry <= 0) {
-                    forceExit();
-                }
             }
         }
-        LOG.info("=============== Handle Event end ===============");
+        if (retry < 0) {
+            forceExit();
+        }
+        TransactionThread transaction = new TransactionThread(snapshot);
+        transaction.calculateMyTasks(projectState.getProjectName(), workerList, taskList);
+        transaction.start();
     }
 
-    private void recalculateMyTasks() {
-        synchronized (rebalanceLock){
-            LOG.info("recalculateMyTasks");
-            myTaskList = rebalanceTool.calculateMyTask(myId, taskList, workerList);
-            LOG.info("calculated tasks: " + myTaskList.toString());
-        }
-    }
 
     void forceExit() {
         LOG.error("Fatal error! Will exit to release resources.");
@@ -269,30 +194,32 @@ public class LibraClient {
         }
     }
 
-    synchronized void setTaskList(List<String> newCurrentTaskList, ClientDataVersion snapshot){
+    void setTaskList(List<String> newCurrentTaskList) {
         this.taskList = newCurrentTaskList;
         currentState.updateTaskListVersion();
-        snapshot.updateTaskListVersion();
     }
-    synchronized void setWorkerList(List<String> newCurrentWorkerList, ClientDataVersion snapshot){
+
+    void setWorkerList(List<String> newCurrentWorkerList) {
         this.workerList = newCurrentWorkerList;
         currentState.updateWorkerListVersion();
-        snapshot.updateWorkerListVersion();
     }
-    List<String> getTaskList(){
+
+    List<String> getTaskList() {
         return taskList;
     }
+
     List<String> getWorkerList() {
         return workerList;
     }
+
     static void showUsage() {
         System.out.println("Usage: -n worker_name [-t timeout(default:10000)]|[-h host (default:localhost)]");
     }
 
     public static void main(String args[]) {
         try {
-            String workerName = null;
-            String host = "localhost:2181";
+            String workerName = "worker1";
+            String host = "211.87.224.213:2181";
             int timeout = 10000;
             if (args.length == 2) {
                 if ("-n".equals(args[0])) {
@@ -327,8 +254,8 @@ public class LibraClient {
             }
             ExecutorFactory factory = new ExecutorFactory();
 //                factory.loadExecutorsFromFile("executors.xml");
-            LibraClient watcher = new LibraClient(workerName, host, timeout, new ExecutorFactory());
-            watcher.start();
+            LibraClient client = new LibraClient(workerName, host, timeout, new ExecutorFactory());
+            client.start();
             System.out.println("INFO: Worker " + workerName + " at " + host + " is Running... ");
             Thread.sleep(6000000);
             System.out.println("INFO: Worker " + workerName + "exit.");
@@ -340,6 +267,94 @@ public class LibraClient {
             e.printStackTrace();
         } catch (ConfigException e) {
             e.printStackTrace();
+        }
+    }
+
+    private class TransactionThread extends Thread {
+        String projectName;
+        ZKDataVersion snapshot;
+        List<String> myTaskList;
+
+        public TransactionThread(ZKDataVersion snapshot) {
+            this.snapshot = snapshot;
+        }
+
+        public void calculateMyTasks(String projectName, List<String> workerList, List<String> taskList) {
+            this.projectName = projectName;
+            myTaskList = rebalanceTool.calculateMyTask(myId, taskList, workerList);
+            LOG.info("\nprojectName = " + projectName + "\nworkerList = " + workerList + "\ntaskList = " + taskList + "\nmyTaskList = " + myTaskList);
+        }
+
+        @Override
+        public void run() {
+            synchronized (rebalanceLock) {
+                super.run();
+                int retry = LibraClientConfig.getIntProperty(LibraClientConfig.RETRY_TIMES_KEY);
+                Set<String> taskToBeReleased = new HashSet<>(executorFactory.getCurrentTaskList());
+                Set<String> taskToBeOwned = new HashSet<>(myTaskList);
+                Set<String> taskReleased = new HashSet<>();
+                Set<String> taskOwned = new HashSet<>();
+                boolean success = false;
+                LOG.info("=============== Handle Event Thread Start ===============");
+                while (!success && retry > 0) {
+                    try {
+                        currentState.checkOutOfDate(snapshot);
+                        if (!projectState.isActive()) {
+                            throw new ZKOperationFailedException("Project state is not active.");
+                        }
+                        reassignTasks(projectName, myTaskList, taskToBeReleased, taskReleased, taskToBeOwned, taskOwned);
+                        success = true;
+                        break;
+                    } catch (OperationOutOfDateException ex) {
+                        ex.printStackTrace();
+                        LOG.warn("Operation is out of date! Will rollback!");
+                        Set<String> rollbackTaskReleased = new HashSet<>();
+                        retry = LibraClientConfig.getIntProperty(LibraClientConfig.RETRY_TIMES_KEY);
+                        success = false;
+                        while (!success && retry >= 0) {
+                            try {
+                                agent.releaseTasks(projectState.getProjectName(), taskOwned, rollbackTaskReleased);
+                                success = true;
+                            } catch (InterruptedException e) {
+                                e.printStackTrace();
+                                forceExit();
+                            } catch (Exception e) {
+                                e.printStackTrace();
+                                if (e instanceof KeeperException) {
+                                    agent.reset();
+                                }
+                                --retry;
+                                LOG.warn("Exception encountered! Will retry in " + retryInterval + " ms, " + retry + " times left.");
+                                try {
+                                    Thread.sleep(retryInterval);
+                                } catch (InterruptedException exc) {
+                                    exc.printStackTrace();
+                                }
+                            }
+                        }
+                    } catch (InterruptedException ex) {
+                        ex.printStackTrace();
+                        forceExit();
+                    } catch (Exception ex) {
+                        ex.printStackTrace();
+                        if (ex instanceof KeeperException) {
+                            agent.reset();
+                        }
+                        --retry;
+                        LOG.warn("Exception encountered! Will retry in " + retryInterval + " ms, " + retry + " times left.");
+                        try {
+                            Thread.sleep(retryInterval);
+                        } catch (InterruptedException e) {
+                            e.printStackTrace();
+                        }
+                    } finally {
+                        if (retry <= 0) {
+                            forceExit();
+                        }
+                    }
+                }
+                LOG.info("=============== Handle Event Thread End ===============");
+            }
         }
     }
 }

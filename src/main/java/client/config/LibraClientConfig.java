@@ -10,13 +10,13 @@ import java.util.Map;
  * Time: 8:07
  */
 public class LibraClientConfig {
-    public static Map<String, String> propertyMap = new HashMap<String, String>();
-    private static Map<String, String> defaultPropertyMap = new HashMap<String, String>();
+    public static Map<String, String> propertyMap = new HashMap<>();
+    private static Map<String, String> defaultPropertyMap = new HashMap<>();
 
     public static final String RETRY_TIMES_KEY = "retryTimes";
     private static final String RETRY_TIMES_DEFAULT = "5";
     public static final String RETRY_INTERVAL_KEY = "retryInterval";
-    private static final String RETRY_INTERVAL_DEFAULT = "1000";
+    private static final String RETRY_INTERVAL_DEFAULT = "5000";
 
 
 

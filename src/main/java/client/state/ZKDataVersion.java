@@ -4,10 +4,10 @@ import common.exception.OperationOutOfDateException;
 
 /**
  * @author xccui
- * Date: 14-10-20
- * Time: 11:15
+ *         Date: 14-10-20
+ *         Time: 11:15
  */
-public class ClientDataVersion {
+public class ZKDataVersion {
     private long projectVersion;
     private long taskListVersion;
     private long workerListVersion;
@@ -37,8 +37,8 @@ public class ClientDataVersion {
         workerListVersion++;
     }
 
-    public synchronized ClientDataVersion makeSnapshot() {
-        ClientDataVersion snapshot = new ClientDataVersion();
+    public synchronized ZKDataVersion makeSnapshot() {
+        ZKDataVersion snapshot = new ZKDataVersion();
         snapshot.projectVersion = projectVersion;
         snapshot.workerListVersion = workerListVersion;
         snapshot.taskListVersion = taskListVersion;
@@ -49,13 +49,13 @@ public class ClientDataVersion {
         return projectVersion + " " + taskListVersion + " " + workerListVersion;
     }
 
-    public synchronized void checkOutOfDate(ClientDataVersion currentDataVersion) throws OperationOutOfDateException {
-        if(null == currentDataVersion) {
+    public synchronized void checkOutOfDate(ZKDataVersion currentDataVersion) throws OperationOutOfDateException {
+        if (null == currentDataVersion) {
             return;
         }
         if (!(projectVersion == currentDataVersion.projectVersion && workerListVersion == currentDataVersion.workerListVersion
                 && taskListVersion == currentDataVersion.taskListVersion)) {
-            throw new OperationOutOfDateException("State is out of date!\n"+getStateString()+" | "+currentDataVersion.getStateString());
+            throw new OperationOutOfDateException("State is out of date - " + getStateString() + " | " + currentDataVersion.getStateString());
         }
     }
 }
